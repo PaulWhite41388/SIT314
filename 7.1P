@@ -1,1 +1,281 @@
+import tkinter as tk
+from tkinter import simpledialog
+import json
+import os
+import RPi.GPIO as GPIO
+import time
+import ssl
+import paho.mqtt.client as mqtt
 
+# Set GPIO mode
+GPIO.setmode(GPIO.BCM)
+
+# MQTT broker configuration
+mqttBroker = "ec4259ec9783421096b1d21b7a0f1fe5.s2.eu.hivemq.cloud"
+mqttPort = 8883
+mqttUsername = "PaulW"
+mqttPassword = "element1"
+mqttClientId = "Light_Controller"
+
+# Set up MQTT client
+mqttClient = mqtt.Client(mqttClientId)
+mqttClient.username_pw_set(username=mqttUsername, password=mqttPassword)
+mqttClient.tls_set(tls_version=ssl.PROTOCOL_TLS)
+mqttClient.connect(mqttBroker, port=mqttPort, keepalive=60)
+
+# Subscribe to the "Override" topic
+mqttClient.subscribe("Override", qos=1)
+
+# Set GPIO mode
+GPIO.setmode(GPIO.BCM)
+
+# Additional GPIO pin for the button
+button_pin = 21
+
+# Set up GPIO pin for the button
+GPIO.setup(button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# Dictionary to store the start time and alert status of each light
+time_on_dict = {}
+alert_sent_dict = {}
+
+# List to store GPIO pins for each floor and light
+gpio_pins = []
+
+def setup_gpio_pins():
+    global gpio_pins, time_on_dict, num_floors, num_lights_per_floor, alert_sent_dict
+
+    # Prompt the user for the number of floors and lights
+    num_floors, num_lights_per_floor, _ = get_floor_and_lights()
+
+    # Clear existing GPIO settings
+    # GPIO.cleanup()
+
+    # Initialize GPIO pins based on the number of floors and lights
+    gpio_pins = [[GPIO.setup(pin, GPIO.OUT) or pin for pin in range(17 + floor * 2, 17 + floor * 2 + num_lights_per_floor[floor])]
+                 for floor in range(num_floors)]
+
+    # Initialize time_on_dict and alert_sent_dict with keys for all floors and lights
+    time_on_dict = {floor: {light: 0 for light in range(num_lights_per_floor[floor])} for floor in range(num_floors)}
+    alert_sent_dict = {floor: {light: False for light in range(num_lights_per_floor[floor])} for floor in range(num_floors)}
+
+    # Return num_floors
+    return num_floors
+
+def publish_alert(floor, light):
+    topic = "Alerts"
+    message = f"Light {light + 1} on Floor {floor + 1} has been on for more than 10 seconds!"
+    mqttClient.publish(topic, message, qos=1)  # Publish with QoS 1
+    print(message)
+
+def publish_state(floor, light, state):
+    topic = "States"
+    message = f"Light {light + 1} on Floor {floor + 1} toggled. State: {state}"
+    mqttClient.publish(topic, message, qos=1)  # Publish with QoS 1
+    print(message)
+
+def turn_on_floor(floor):
+    for led in range(len(gpio_pins[floor])):
+        pin = gpio_pins[floor][led]
+        GPIO.output(pin, GPIO.HIGH if lights[floor][led] else GPIO.LOW)
+
+def turn_off_floor(floor):
+    for led in range(len(gpio_pins[floor])):
+        GPIO.output(gpio_pins[floor][led], GPIO.LOW)
+
+def turn_off_all():
+    for pin in gpio_pins:
+        GPIO.output(pin, GPIO.LOW)
+
+def toggle_led(floor, led):
+    pin = gpio_pins[floor][led]
+    GPIO.output(pin, not GPIO.input(pin))
+
+def save_to_json(filename, data):
+    with open(filename, 'w') as json_file:
+        json.dump(data, json_file, indent=2)
+
+def load_from_json(filename):
+    try:
+        with open(filename, 'r') as json_file:
+            return json.load(json_file)
+    except FileNotFoundError:
+        return None
+
+def get_floor_and_lights():
+    # Prompt the user for the number of floors
+    num_floors = simpledialog.askinteger("Input", "Enter the number of floors:", minvalue=1)
+
+    # Initialize a list to store the number of lights on each floor
+    num_lights_per_floor = []
+    lights = []  # List to store the initial state of lights on each floor
+    for floor in range(1, num_floors + 1):
+        num_lights = simpledialog.askinteger("Input", f"Enter the number of lights on Floor {floor}:", minvalue=1)
+        num_lights_per_floor.append(num_lights)
+        lights.append([False] * num_lights)  # Initialize lights to be off by default
+
+    return num_floors, num_lights_per_floor, lights
+
+def check_and_update_lights():
+    for floor in range(num_floors):
+        for light in range(num_lights_per_floor[floor]):
+            pin = gpio_pins[floor][light]
+            GPIO.output(pin, GPIO.HIGH if lights[floor][light] else GPIO.LOW)
+
+def check_lights_status():
+    current_time = time.time()
+    for floor in range(num_floors):
+        for light in range(num_lights_per_floor[floor]):
+            is_light_on = lights[floor][light]
+            time_on = time_on_dict[floor][light]
+            alert_sent = alert_sent_dict[floor][light]
+
+            if is_light_on:
+                elapsed_time = current_time - time_on
+                if elapsed_time > 10 and not alert_sent:
+                    publish_alert(floor, light)
+                    alert_sent_dict[floor][light] = True  # Set alert sent to True
+
+            else:
+                # Reset start time and alert status if turned off
+                time_on_dict[floor][light] = 0
+                alert_sent_dict[floor][light] = False
+
+    # Schedule the function to run again after 1000 ms (1 second)
+    root.after(1000, check_lights_status)
+
+def on_message(client, userdata, msg):
+    # Callback for handling messages on the "Override" topic
+    payload = msg.payload.decode("utf-8")
+    handle_override_message(payload)
+
+def handle_override_message(message):
+    # Process the override message and control the lights accordingly
+    parts = message.split(", ")
+    if len(parts) == 3 and parts[0].startswith("Floor") and parts[1].startswith("Light") and parts[2] in ["On", "Off"]:
+        floor_num = int(parts[0].split()[-1]) - 1
+        light_num = int(parts[1].split()[-1]) - 1
+        new_state = parts[2] == "On"
+
+        # Update the lights and GPIO accordingly
+        lights[floor_num][light_num] = new_state
+        toggle_led(floor_num, light_num)
+
+        # Update GUI and publish state
+        update_gui()
+        state = "On" if new_state else "Off"
+        publish_state(floor_num, light_num, state)
+
+# Set the on_message callback for the "Override" topic
+mqttClient.on_message = on_message
+
+# Get the absolute path to the script
+script_dir = os.path.dirname(os.path.abspath(__file__))
+json_file_path = os.path.join(script_dir, 'building_data.json')
+
+# Create the main window
+root = tk.Tk()
+root.title("Light Control")
+
+# Call the function to get floor and lights information after creating the Tkinter root window
+num_floors = setup_gpio_pins()
+
+# Set a fixed number of columns for lights on each floor (e.g., 10)
+num_columns = 10
+
+# Variable to store the currently selected floor
+selected_floor = 0
+
+def toggle_light(light):
+    if light < num_lights_per_floor[selected_floor]:
+        lights[selected_floor][light] = not lights[selected_floor][light]
+        toggle_led(selected_floor, light)  # Add GPIO control
+        if lights[selected_floor][light]:
+            time_on_dict[selected_floor][light] = time.time()  # Update start time
+        update_gui()
+        state = "On" if lights[selected_floor][light] else "Off"
+        publish_state(selected_floor, light, state)
+
+def manual_toggle_light(channel):
+    toggle_light(0)  # Toggle the first light on the first floor manually
+
+def create_button(light):
+    return tk.Button(root, text=f"Light {light + 1}", width=8, height=2)
+
+def update_buttons():
+    for light, button in enumerate(buttons):
+        is_light_on = lights[selected_floor][light]
+        alert_sent = alert_sent_dict[selected_floor][light]
+        button.configure(command=lambda l=light: toggle_light(l),
+                         bg="red" if is_light_on and (time.time() - time_on_dict[selected_floor][light] > 10) and not alert_sent else
+                         "yellow" if is_light_on else "white")
+
+def destroy_buttons():
+    for button in buttons:
+        button.destroy()
+    buttons.clear()
+
+def update_gui():
+    # Ensure selected_floor is within the valid range
+    if 0 <= selected_floor < num_floors:
+        destroy_buttons()
+
+        # Create new buttons for lights on the selected floor
+        for light in range(num_lights_per_floor[selected_floor]):
+            button = create_button(light)
+            button.grid(row=light // 10 + 1, column=light % 10)
+            buttons.append(button)
+
+        update_buttons()
+
+def select_floor(floor):
+    global selected_floor
+    selected_floor = floor
+    update_gui()
+    turn_on_floor(selected_floor)  # Add GPIO control
+    floor_label.config(text=f"Floor {selected_floor + 1}")
+
+def exit_app():
+    save_data = {'num_floors': num_floors, 'num_lights_per_floor': num_lights_per_floor, 'lights': lights}
+    save_to_json(json_file_path, save_data)
+    turn_off_all()  # Add GPIO control
+    GPIO.cleanup()  # Clean up GPIO settings on program exit
+    root.destroy()
+
+# Try to load data from the JSON file
+loaded_data = load_from_json(json_file_path)
+if loaded_data:
+    num_floors = loaded_data['num_floors']
+    num_lights_per_floor = loaded_data['num_lights_per_floor']
+    lights = loaded_data['lights']
+    check_and_update_lights()  # Check and update lights based on the loaded data
+
+# Check lights status every second
+check_lights_status()
+
+# Set up event detection for the physical button press
+GPIO.add_event_detect(button_pin, GPIO.FALLING, callback=manual_toggle_light, bouncetime=300)
+
+# Create a frame for the menu
+menu_frame = tk.Frame(root)
+menu_frame.grid(row=0, column=0, columnspan=num_columns)
+floor_label = tk.Label(menu_frame, text=f"Floor {selected_floor + 1}")
+floor_label.grid(row=0, column=num_columns//2)
+for floor in range(num_floors):
+    floor_button = tk.Button(menu_frame, text=f"Floor {floor + 1}", command=lambda f=floor: select_floor(f))
+    floor_button.grid(row=1, column=floor)
+exit_button = tk.Button(menu_frame, text="Exit", command=exit_app)
+exit_button.grid(row=1, column=num_floors)
+
+# Create a list of buttons to represent lights on a single floor
+buttons = []
+for light in range(num_lights_per_floor[selected_floor]):
+    button = create_button(light)
+    button.grid(row=light // 10 + 1, column=light % 10)
+    buttons.append(button)
+
+# Start the MQTT loop in a separate thread
+mqttClient.loop_start()
+
+# Start the GUI main loop
+root.mainloop()
